@@ -3,9 +3,9 @@
  * WebGPU Snow - 使用 WebGPU 实现的下雪粒子效果插件
  *
  * @package WebGPUSnow
- * @author Your Name
+ * @author wyh
  * @version 1.0.0
- * @link https://your-site.com
+ * @link https://www.pslanys.com
  */
 
 class WebGPUSnow_Plugin implements Typecho_Plugin_Interface
