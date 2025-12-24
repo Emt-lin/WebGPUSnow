@@ -1,0 +1,14 @@
+/**
+ * WebGPU Snow Plugin Styles
+ */
+
+#webgpu-snow-canvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+    pointer-events: none;
+    z-index: var(--snow-z-index, 9999);
+}
