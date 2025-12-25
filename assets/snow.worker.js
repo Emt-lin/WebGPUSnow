@@ -18,6 +18,10 @@
 const SHADER_CODE = `
 struct Uniforms {
     viewportSize: vec2f,
+    snowSpeed: f32,
+    windForce: f32,
+    sizeMin: f32,
+    sizeMax: f32,
 }
 
 struct Particle {
@@ -59,7 +63,7 @@ fn rand() -> f32 {
 fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
     initRand(globalInvocationId.x, simulationCtx.randSeed);
     let timeDelta = simulationCtx.timeDelta / 10.0;
-    let wind = sin(simulationCtx.time / 5000.0) * 0.0002;
+    let wind = sin(simulationCtx.time / 5000.0) * (uniforms.windForce / 100.0);
 
     var particle = writableParticles[globalInvocationId.x];
 
@@ -74,14 +78,18 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
             let distance = baseDistance + rand() * distanceVariation;
             particle.distance = distance;
 
+            // 保留双峰分布，sizeMin/sizeMax 作为缩放因子
             let largeFlake = rand() > 0.92;
-            let baseSize = select(5.0, 10.0, largeFlake);
-            let sizeVariation = select(3.5, 5.0, largeFlake);
+            let sizeRange = uniforms.sizeMax - uniforms.sizeMin;
+            let baseRatio = select(0.0, 0.5, largeFlake);
+            let variationRatio = select(0.35, 0.5, largeFlake);
+            let size = uniforms.sizeMin + sizeRange * (baseRatio + rand() * variationRatio);
             let distanceFactor = (distance / 9.0) * 0.1 + 1.0;
-            particle.size = vec2f(baseSize + rand() * sizeVariation) * distanceFactor;
+            particle.size = vec2f(size) * distanceFactor;
 
+            // snowSpeed 同时缩放初速度
             let vyVariation = select(2.0, particle.size.y, largeFlake);
-            particle.velocity = vec2f(-1.5 + rand() * 3.0, rand() * vyVariation);
+            particle.velocity = vec2f(-1.5 + rand() * 3.0, rand() * vyVariation * uniforms.snowSpeed);
 
             particle.opacity = 1.0 - distance / 9.0;
             particle.spawned = 1;
@@ -89,7 +97,7 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
     }
 
     particle.velocity.x += wind * timeDelta;
-    particle.velocity.y += 0.03 * timeDelta;
+    particle.velocity.y += 0.03 * uniforms.snowSpeed * timeDelta;
     particle.position += particle.velocity * timeDelta;
     writableParticles[globalInvocationId.x] = particle;
 }
@@ -143,6 +151,7 @@ const PARTICLE_COUNT = 10000;
 const SIZEOF_F32 = 4;
 const PARTICLE_STRUCT_SIZE = 40;
 const SIMULATION_CTX_SIZE = 16;
+const UNIFORMS_SIZE = 32;
 
 function post(type, payload) {
     try { self.postMessage({ type, ...(payload || {}) }); } catch (_) {}
@@ -221,7 +230,7 @@ class WebGPUSnowWorkerRenderer {
         this.shaderModule = this.device.createShaderModule({ code: SHADER_CODE });
 
         this.uniformBuffer = this.device.createBuffer({
-            size: 2 * SIZEOF_F32,
+            size: UNIFORMS_SIZE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -306,7 +315,11 @@ class WebGPUSnowWorkerRenderer {
             return;
         }
 
-        const uniformData = new Float32Array([width, height]);
+        const { snowSpeed = 1.0, windForce = 0.02, sizeMin = 3, sizeMax = 12 } = this.config;
+        const uniformData = new Float32Array([
+            width, height,
+            snowSpeed, windForce, sizeMin, sizeMax
+        ]);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
 
         const bufferView = new DataView(this.simulationCtxLocalBuffer);

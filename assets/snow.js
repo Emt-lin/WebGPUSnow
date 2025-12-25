@@ -10,6 +10,10 @@ const SHADER_CODE = `
 // ========== 数据结构 ==========
 struct Uniforms {
     viewportSize: vec2f,
+    snowSpeed: f32,
+    windForce: f32,
+    sizeMin: f32,
+    sizeMax: f32,
 }
 
 struct Particle {
@@ -61,7 +65,8 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
     initRand(globalInvocationId.x, simulationCtx.randSeed);
 
     let timeDelta = simulationCtx.timeDelta / 10.0;
-    let wind = sin(simulationCtx.time / 5000.0) * 0.0002;
+    // Reason: windForce 从 uniform 传入，默认 0.02 对应原硬编码 0.0002
+    let wind = sin(simulationCtx.time / 5000.0) * (uniforms.windForce / 100.0);
 
     var particle = writableParticles[globalInvocationId.x];
 
@@ -79,16 +84,19 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
             let distance = baseDistance + rand() * distanceVariation;
             particle.distance = distance;
 
-            // 大雪花概率
+            // Reason: 保留双峰分布，sizeMin/sizeMax 作为缩放因子
             let largeFlake = rand() > 0.92;
-            let baseSize = select(5.0, 10.0, largeFlake);
-            let sizeVariation = select(3.5, 5.0, largeFlake);
+            let sizeRange = uniforms.sizeMax - uniforms.sizeMin;
+            // 小雪花占 0~35% 范围，大雪花占 50~100% 范围
+            let baseRatio = select(0.0, 0.5, largeFlake);
+            let variationRatio = select(0.35, 0.5, largeFlake);
+            let size = uniforms.sizeMin + sizeRange * (baseRatio + rand() * variationRatio);
             let distanceFactor = (distance / 9.0) * 0.1 + 1.0;
-            particle.size = vec2f(baseSize + rand() * sizeVariation) * distanceFactor;
+            particle.size = vec2f(size) * distanceFactor;
 
-            // 速度
+            // 速度：snowSpeed 同时缩放初速度
             let vyVariation = select(2.0, particle.size.y, largeFlake);
-            particle.velocity = vec2f(-1.5 + rand() * 3.0, rand() * vyVariation);
+            particle.velocity = vec2f(-1.5 + rand() * 3.0, rand() * vyVariation * uniforms.snowSpeed);
 
             particle.opacity = 1.0 - distance / 9.0;
             particle.spawned = 1;
@@ -97,7 +105,8 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
 
     // 更新运动
     particle.velocity.x += wind * timeDelta;
-    particle.velocity.y += 0.03 * timeDelta;
+    // Reason: snowSpeed 控制下落加速度，默认 1.0 对应原硬编码 0.03
+    particle.velocity.y += 0.03 * uniforms.snowSpeed * timeDelta;
     particle.position += particle.velocity * timeDelta;
 
     writableParticles[globalInvocationId.x] = particle;
@@ -174,6 +183,9 @@ const PARTICLE_STRUCT_SIZE = 40;
 // SimulationContext 结构大小: time(4) + timeDelta(4) + randSeed(4) + particlesToSpawn(4) = 16 bytes
 const SIMULATION_CTX_SIZE = 16;
 
+// Uniforms 结构大小: viewportSize(8) + snowSpeed(4) + windForce(4) + sizeMin(4) + sizeMax(4) = 24 bytes, 对齐到 32
+const UNIFORMS_SIZE = 32;
+
 // ==================== WebGPU 渲染器类 ====================
 class WebGPUSnowRenderer {
     constructor(canvas, config) {
@@ -222,9 +234,9 @@ class WebGPUSnowRenderer {
         // 创建 Shader 模块
         this.shaderModule = this.device.createShaderModule({ code: SHADER_CODE });
 
-        // Uniform Buffer (viewportSize)
+        // Uniform Buffer (viewportSize + snowSpeed + windForce + sizeMin + sizeMax)
         this.uniformBuffer = this.device.createBuffer({
-            size: 2 * SIZEOF_F32,
+            size: UNIFORMS_SIZE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -333,8 +345,12 @@ class WebGPUSnowRenderer {
             return;
         }
 
-        // 更新 Uniforms (viewportSize)
-        const uniformData = new Float32Array([this.canvas.width, this.canvas.height]);
+        // 更新 Uniforms (viewportSize + snowSpeed + windForce + sizeMin + sizeMax)
+        const { snowSpeed, windForce, sizeMin, sizeMax } = this.config;
+        const uniformData = new Float32Array([
+            this.canvas.width, this.canvas.height,
+            snowSpeed, windForce, sizeMin, sizeMax
+        ]);
         this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
 
         // 更新 SimulationContext
@@ -464,6 +480,10 @@ class Canvas2DSnowRenderer {
 
         const maxParticles = Math.min(this.config.particleCount || 10000, 3000);
 
+        // Reason: 使用配置的 sizeMin/sizeMax 代替硬编码值
+        const { sizeMin, sizeMax, snowSpeed, windForce } = this.config;
+        const sizeRange = sizeMax - sizeMin;
+
         // 派生新粒子
         this.spawnBudget += Math.random() * timeDelta;
         while (this.spawnBudget > 0 && this.particles.length < maxParticles) {
@@ -471,15 +491,20 @@ class Canvas2DSnowRenderer {
             const baseDistance = nearCamera ? 1 : 6;
             const distance = baseDistance + Math.random() * (nearCamera ? 1 : 3);
 
+            // Reason: 保留双峰分布，sizeMin/sizeMax 作为缩放因子
             const largeFlake = Math.random() > 0.92;
-            const baseSize = largeFlake ? 10 : 5;
-            const size = (baseSize + Math.random() * (largeFlake ? 5 : 3.5)) * ((distance / 9) * 0.1 + 1);
+            const baseRatio = largeFlake ? 0.5 : 0;
+            const variationRatio = largeFlake ? 0.5 : 0.35;
+            const size = (sizeMin + sizeRange * (baseRatio + Math.random() * variationRatio)) * ((distance / 9) * 0.1 + 1);
+
+            // Reason: snowSpeed 同时缩放初速度
+            const vyVariation = largeFlake ? size : 2;
 
             this.particles.push({
                 x: Math.random() * width,
                 y: -100,
                 vx: -1.5 + Math.random() * 3,
-                vy: Math.random() * (largeFlake ? size : 2),
+                vy: Math.random() * vyVariation * snowSpeed,
                 size,
                 distance,
                 opacity: 1 - distance / 9
@@ -487,7 +512,8 @@ class Canvas2DSnowRenderer {
             this.spawnBudget -= 1;
         }
 
-        const wind = Math.sin(timestamp / 5000) * 0.0002;
+        // Reason: windForce 控制基础风力强度，默认 0.02 对应原硬编码 0.0002
+        const wind = Math.sin(timestamp / 5000) * (windForce / 100);
         const dt = timeDelta / 10;
 
         this.ctx.clearRect(0, 0, width, height);
@@ -496,7 +522,8 @@ class Canvas2DSnowRenderer {
             const p = this.particles[i];
 
             p.vx += wind * dt;
-            p.vy += 0.03 * dt;
+            // Reason: snowSpeed 控制下落加速度，默认 1.0 对应原硬编码 0.03
+            p.vy += 0.03 * snowSpeed * dt;
             p.x += p.vx * dt;
             p.y += p.vy * dt;
 
@@ -723,6 +750,10 @@ class WorkerWebGPUSnowRenderer {
 // ==================== 配置校验 ====================
 const DEFAULT_CONFIG = {
     particleCount: 10000,
+    snowSpeed: 1.0,
+    windForce: 0.02,
+    sizeMin: 3,
+    sizeMax: 12,
     zIndex: 9999,
     useFallback: 'auto'
 };
@@ -733,6 +764,25 @@ function normalizeConfig(raw) {
     const particleCount = Number(cfg.particleCount);
     cfg.particleCount = Number.isFinite(particleCount) ? Math.max(1, Math.floor(particleCount)) : DEFAULT_CONFIG.particleCount;
     cfg.particleCount = Math.min(cfg.particleCount, 100000);
+
+    // Reason: snowSpeed 控制下落速度系数，必须为正数
+    const snowSpeed = Number(cfg.snowSpeed);
+    cfg.snowSpeed = (Number.isFinite(snowSpeed) && snowSpeed > 0) ? snowSpeed : DEFAULT_CONFIG.snowSpeed;
+
+    // Reason: windForce 可为正负数（正向右，负向左），0 表示无风
+    const windForce = Number(cfg.windForce);
+    cfg.windForce = Number.isFinite(windForce) ? windForce : DEFAULT_CONFIG.windForce;
+
+    // Reason: sizeMin/sizeMax 定义雪花大小范围，自动交换确保 min <= max
+    let sizeMin = Number(cfg.sizeMin);
+    let sizeMax = Number(cfg.sizeMax);
+    sizeMin = (Number.isFinite(sizeMin) && sizeMin > 0) ? sizeMin : DEFAULT_CONFIG.sizeMin;
+    sizeMax = (Number.isFinite(sizeMax) && sizeMax > 0) ? sizeMax : DEFAULT_CONFIG.sizeMax;
+    if (sizeMax < sizeMin) {
+        [sizeMin, sizeMax] = [sizeMax, sizeMin];
+    }
+    cfg.sizeMin = sizeMin;
+    cfg.sizeMax = sizeMax;
 
     const zIndex = Number(cfg.zIndex);
     cfg.zIndex = Number.isFinite(zIndex) ? Math.floor(zIndex) : DEFAULT_CONFIG.zIndex;
