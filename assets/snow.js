@@ -154,21 +154,73 @@ fn particleVertex(in: QuadVertexInput) -> QuadVertexOutput {
     return out;
 }
 
+// ========== SDF 辅助函数 ==========
+fn sdSegment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+fn sdHexagon(p: vec2f, r: f32) -> f32 {
+    let k = vec3f(-0.866025404, 0.5, 0.577350269);
+    var q = abs(p);
+    q = q - 2.0 * min(dot(k.xy, q), 0.0) * k.xy;
+    q = q - vec2f(clamp(q.x, -k.z * r, k.z * r), r);
+    return length(q) * sign(q.y);
+}
+
+// Reason: 修正后的空间折叠，正确折叠到 0~30 度扇区
+fn fold_hex_30(p_in: vec2f) -> vec2f {
+    var p = vec2f(p_in.x, abs(p_in.y));
+    let n60 = vec2f(0.8660254, -0.5);
+    p -= 2.0 * min(dot(p, n60), 0.0) * n60;
+    p.y = abs(p.y);
+    let n30 = vec2f(0.5, -0.8660254);
+    p -= 2.0 * min(dot(p, n30), 0.0) * n30;
+    return vec2f(p.x, abs(p.y));
+}
+
 // ========== Fragment Shader ==========
 @fragment
 fn particleFragment(in: QuadVertexOutput) -> @location(0) vec4f {
-    // 裁剪超出视口的片元
-    if (in.position.x > uniforms.viewportSize.x ||
-        in.position.y > uniforms.viewportSize.y) {
+    if (in.position.x > uniforms.viewportSize.x || in.position.y > uniforms.viewportSize.y) {
         discard;
     }
 
-    // 径向衰减，distance 作为 pow 指数
-    let dis = pow(distance(in.uv.xy, vec2f(0.0, 0.0)), in.distance);
-    let brightness = (1.0 - dis) * in.opacity;
+    let uv = in.uv * 1.1;
+    let p = fold_hex_30(uv);
 
-    // 输出 premultiplied 颜色
-    return vec4f(brightness);
+    var d = 100.0;
+
+    // 中心六边形轮廓
+    d = min(d, abs(sdHexagon(uv, 0.12)) - 0.008);
+
+    // 主枝 (沿 X 轴)
+    d = min(d, sdSegment(p, vec2f(0.1, 0.0), vec2f(0.9, 0.0)));
+
+    // 末端分叉
+    d = min(d, sdSegment(p, vec2f(0.7, 0.0), vec2f(0.88, 0.15)));
+
+    // 中部分叉
+    d = min(d, sdSegment(p, vec2f(0.45, 0.0), vec2f(0.6, 0.12)));
+
+    // 次枝 (30度方向，位于两个主枝之间)
+    let dir_30 = vec2f(0.8660254, 0.5);
+    let proj_len = clamp(dot(p, dir_30), 0.2, 0.5);
+    d = min(d, length(p - dir_30 * proj_len));
+
+    // 渲染：固定线宽 + 基于 distance 的柔和度
+    let thickness = 0.022;
+    let softness = 0.008 + (1.0 / max(in.distance, 1.0)) * 0.02;
+    var alpha = 1.0 - smoothstep(thickness, thickness + softness, d);
+
+    // 柔和发光效果
+    let glow = exp(-max(d, 0.0) * 12.0) * 0.25;
+    alpha = alpha + glow;
+    alpha = clamp(alpha * in.opacity, 0.0, 1.0);
+
+    return vec4f(alpha);
 }
 `;
 
@@ -437,17 +489,69 @@ class Canvas2DSnowRenderer {
     }
 
     _createSnowflakeSprite() {
-        const size = 32;
+        const size = 64;
         const offscreen = document.createElement('canvas');
         offscreen.width = size;
         offscreen.height = size;
         const ctx = offscreen.getContext('2d');
 
-        const gradient = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-        gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-        gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, size, size);
+        const cx = size / 2;
+        const cy = size / 2;
+        const scale = size / 2 * 0.85;
+
+        ctx.strokeStyle = 'white';
+        ctx.lineCap = 'round';
+        ctx.lineWidth = 2;
+
+        // 绘制 6 个主枝 + 分叉
+        for (let i = 0; i < 6; i++) {
+            const angle = (i * 60) * Math.PI / 180;
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(angle);
+
+            // 主枝
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(scale, 0);
+            ctx.stroke();
+
+            // 末端分叉
+            ctx.beginPath();
+            ctx.moveTo(scale * 0.75, 0);
+            ctx.lineTo(scale * 0.95, scale * 0.18);
+            ctx.moveTo(scale * 0.75, 0);
+            ctx.lineTo(scale * 0.95, -scale * 0.18);
+            ctx.stroke();
+
+            // 中部分叉
+            ctx.beginPath();
+            ctx.moveTo(scale * 0.5, 0);
+            ctx.lineTo(scale * 0.65, scale * 0.12);
+            ctx.moveTo(scale * 0.5, 0);
+            ctx.lineTo(scale * 0.65, -scale * 0.12);
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        // 中心六边形
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+            const angle = (i * 60 - 30) * Math.PI / 180;
+            const x = cx + Math.cos(angle) * scale * 0.15;
+            const y = cy + Math.sin(angle) * scale * 0.15;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // 添加发光效果
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.filter = 'blur(2px)';
+        ctx.globalAlpha = 0.3;
+        ctx.drawImage(offscreen, 0, 0);
 
         this.snowflakeCache = offscreen;
     }
@@ -532,7 +636,8 @@ class Canvas2DSnowRenderer {
                 continue;
             }
 
-            const drawSize = p.size * 2;
+            // Reason: 与 WebGPU 版本保持一致，size 即为绘制尺寸
+            const drawSize = p.size;
             this.ctx.globalAlpha = p.opacity;
             this.ctx.drawImage(
                 this.snowflakeCache,

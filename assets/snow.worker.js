@@ -135,14 +135,59 @@ fn particleVertex(in: QuadVertexInput) -> QuadVertexOutput {
     return out;
 }
 
+// SDF 辅助函数
+fn sdSegment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+fn sdHexagon(p: vec2f, r: f32) -> f32 {
+    let k = vec3f(-0.866025404, 0.5, 0.577350269);
+    var q = abs(p);
+    q = q - 2.0 * min(dot(k.xy, q), 0.0) * k.xy;
+    q = q - vec2f(clamp(q.x, -k.z * r, k.z * r), r);
+    return length(q) * sign(q.y);
+}
+
+fn fold_hex_30(p_in: vec2f) -> vec2f {
+    var p = vec2f(p_in.x, abs(p_in.y));
+    let n60 = vec2f(0.8660254, -0.5);
+    p -= 2.0 * min(dot(p, n60), 0.0) * n60;
+    p.y = abs(p.y);
+    let n30 = vec2f(0.5, -0.8660254);
+    p -= 2.0 * min(dot(p, n30), 0.0) * n30;
+    return vec2f(p.x, abs(p.y));
+}
+
 @fragment
 fn particleFragment(in: QuadVertexOutput) -> @location(0) vec4f {
     if (in.position.x > uniforms.viewportSize.x || in.position.y > uniforms.viewportSize.y) {
         discard;
     }
-    let dis = pow(distance(in.uv.xy, vec2f(0.0, 0.0)), in.distance);
-    let brightness = (1.0 - dis) * in.opacity;
-    return vec4f(brightness);
+
+    let uv = in.uv * 1.1;
+    let p = fold_hex_30(uv);
+
+    var d = 100.0;
+    d = min(d, abs(sdHexagon(uv, 0.12)) - 0.008);
+    d = min(d, sdSegment(p, vec2f(0.1, 0.0), vec2f(0.9, 0.0)));
+    d = min(d, sdSegment(p, vec2f(0.7, 0.0), vec2f(0.88, 0.15)));
+    d = min(d, sdSegment(p, vec2f(0.45, 0.0), vec2f(0.6, 0.12)));
+
+    let dir_30 = vec2f(0.8660254, 0.5);
+    let proj_len = clamp(dot(p, dir_30), 0.2, 0.5);
+    d = min(d, length(p - dir_30 * proj_len));
+
+    let thickness = 0.022;
+    let softness = 0.008 + (1.0 / max(in.distance, 1.0)) * 0.02;
+    var alpha = 1.0 - smoothstep(thickness, thickness + softness, d);
+
+    let glow = exp(-max(d, 0.0) * 12.0) * 0.25;
+    alpha = clamp((alpha + glow) * in.opacity, 0.0, 1.0);
+
+    return vec4f(alpha);
 }
 `;
 
