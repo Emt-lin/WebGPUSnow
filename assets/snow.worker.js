@@ -15,6 +15,8 @@
  */
 
 // ==================== WGSL Shader 代码 ====================
+// ⚠️ 同步维护：此代码与 assets/snow.js 中的 SHADER_CODE 逻辑保持一致
+// 修改时请同时更新两个文件（格式可能略有差异）
 const SHADER_CODE = `
 struct Uniforms {
     viewportSize: vec2f,
@@ -30,6 +32,9 @@ struct Particle {
     velocity: vec2f,
     distance: f32,
     opacity: f32,
+    angle: f32,           // 当前旋转角度 (弧度)
+    angularVelocity: f32, // 旋转速度 (rad/s)
+    fadeRate: f32,        // 渐隐速率 (opacity/s)，0 表示不渐隐
     spawned: i32,
 }
 
@@ -67,7 +72,11 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
 
     var particle = writableParticles[globalInvocationId.x];
 
-    if (particle.spawned == 0 || particle.position.y > uniforms.viewportSize.y) {
+    // 重置条件：未派生或落出屏幕底部
+    let shouldRespawn = particle.spawned == 0 ||
+                        particle.position.y > uniforms.viewportSize.y;
+
+    if (shouldRespawn) {
         if (atomicSub(&simulationCtx.particlesToSpawn, 1) > 0) {
             particle.position.x = rand() * uniforms.viewportSize.x;
             particle.position.y = -100.0;
@@ -92,6 +101,17 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
             particle.velocity = vec2f(-1.5 + rand() * 3.0, rand() * vyVariation * uniforms.snowSpeed);
 
             particle.opacity = 1.0 - distance / 9.0;
+
+            // 旋转参数：30% 概率启用旋转，角速度 ±0.2~1.2 rad/s（轻盈飘动）
+            particle.angle = rand() * 6.28318; // 初始随机角度
+            let shouldRotate = rand() > 0.7;
+            let rotationSpeed = 0.2 + rand() * 1.0; // 0.2~1.2 rad/s（更轻盈）
+            let rotationDir = select(-1.0, 1.0, rand() > 0.5);
+            particle.angularVelocity = select(0.0, rotationSpeed * rotationDir, shouldRotate);
+
+            // 移除随机渐隐，改为落地渐隐（在 Fragment Shader 中处理）
+            particle.fadeRate = 0.0;
+
             particle.spawned = 1;
         }
     }
@@ -99,6 +119,15 @@ fn updateParticles(@builtin(global_invocation_id) globalInvocationId: vec3u) {
     particle.velocity.x += wind * timeDelta;
     particle.velocity.y += 0.03 * uniforms.snowSpeed * timeDelta;
     particle.position += particle.velocity * timeDelta;
+
+    // 更新旋转角度（使用原始毫秒时间）
+    let dtSeconds = simulationCtx.timeDelta * 0.001;
+    particle.angle += particle.angularVelocity * dtSeconds;
+
+    // 摇摆效果：X 轴正弦波偏移（更自然的飘动感）
+    let flutter = sin(simulationCtx.time * 0.003 + particle.position.y * 0.01) * 0.3;
+    particle.position.x += flutter * dtSeconds * 60.0;
+
     writableParticles[globalInvocationId.x] = particle;
 }
 
@@ -110,8 +139,9 @@ struct QuadVertexInput {
 struct QuadVertexOutput {
     @builtin(position) position: vec4f,
     @location(0) uv: vec2f,
-    @location(1) distance: f32,
-    @location(2) opacity: f32,
+    @location(1) @interpolate(flat) distance: f32,
+    @location(2) @interpolate(flat) opacity: f32,
+    @location(3) @interpolate(flat) bottomFade: f32,  // 落地渐隐因子（粒子中心计算，整片统一）
 }
 
 @vertex
@@ -125,13 +155,29 @@ fn particleVertex(in: QuadVertexInput) -> QuadVertexOutput {
     let particlePosNorm = particle.position / uniforms.viewportSize;
     let particleSizeNorm = particle.size / uniforms.viewportSize;
     let vertexPos = vertices[in.vertexIndex];
+
+    // 不旋转顶点位置
     let pos = (particlePosNorm + particleSizeNorm * vertexPos) * 2.0 - 1.0;
+
+    // 在 Vertex Shader 中计算旋转后的 UV（避免 Fragment 每像素 cos/sin）
+    let uv = vertexPos * 2.0;
+    let cosA = cos(particle.angle);
+    let sinA = sin(particle.angle);
+    let rotatedUV = vec2f(
+        uv.x * cosA - uv.y * sinA,
+        uv.x * sinA + uv.y * cosA
+    );
+
+    // 在 Vertex 中计算落地渐隐因子（基于粒子中心，整片统一）
+    let bottomStart = uniforms.viewportSize.y * 0.85;
+    let bottomFade = clamp((particle.position.y - bottomStart) / (uniforms.viewportSize.y * 0.15), 0.0, 1.0);
 
     var out: QuadVertexOutput;
     out.position = vec4f(pos.x, -pos.y, 0.0, 1.0);
-    out.uv = vertexPos * 2.0;
+    out.uv = rotatedUV;  // 传递旋转后的 UV
     out.distance = particle.distance;
     out.opacity = particle.opacity;
+    out.bottomFade = bottomFade;
     return out;
 }
 
@@ -167,6 +213,7 @@ fn particleFragment(in: QuadVertexOutput) -> @location(0) vec4f {
         discard;
     }
 
+    // UV 已在 Vertex Shader 中旋转（避免 Fragment 每像素 cos/sin）
     let uv = in.uv * 1.1;
     let p = fold_hex_30(uv);
 
@@ -185,7 +232,12 @@ fn particleFragment(in: QuadVertexOutput) -> @location(0) vec4f {
     var alpha = 1.0 - smoothstep(thickness, thickness + softness, d);
 
     let glow = exp(-max(d, 0.0) * 12.0) * 0.25;
-    alpha = clamp((alpha + glow) * in.opacity, 0.0, 1.0);
+    alpha = alpha + glow;
+
+    // 落地渐隐：使用 Vertex 传入的渐隐因子（基于粒子中心，整片统一）
+    let finalOpacity = in.opacity * (1.0 - in.bottomFade);
+
+    alpha = clamp(alpha * finalOpacity, 0.0, 1.0);
 
     return vec4f(alpha);
 }
@@ -194,9 +246,14 @@ fn particleFragment(in: QuadVertexOutput) -> @location(0) vec4f {
 // ==================== 常量 ====================
 const PARTICLE_COUNT = 10000;
 const SIZEOF_F32 = 4;
-const PARTICLE_STRUCT_SIZE = 40;
+// Particle 结构大小: position(8) + size(8) + velocity(8) + distance(4) + opacity(4)
+//                  + angle(4) + angularVelocity(4) + fadeRate(4) + spawned(4) = 48 bytes
+const PARTICLE_STRUCT_SIZE = 48;
 const SIMULATION_CTX_SIZE = 16;
 const UNIFORMS_SIZE = 32;
+
+// 时间增量上限（防止 tab 恢复/卡顿时粒子突然跳变）
+const MAX_TIME_DELTA_MS = 50;
 
 function post(type, payload) {
     try { self.postMessage({ type, ...(payload || {}) }); } catch (_) {}
@@ -349,7 +406,8 @@ class WebGPUSnowWorkerRenderer {
     _render(timestamp) {
         if (!this.running) return;
 
-        const timeDelta = timestamp - this.lastTime;
+        const rawTimeDelta = timestamp - this.lastTime;
+        const timeDelta = Math.max(0, Math.min(rawTimeDelta, MAX_TIME_DELTA_MS));
         this.lastTime = timestamp;
         this.time += timeDelta;
 
